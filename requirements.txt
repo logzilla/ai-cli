@@ -1,0 +1,6 @@
+# LogZilla AI query tool dependencies
+# Install with:  pip install -r requirements.txt
+
+requests>=2.28,<3          # REST call that creates the AI conversation
+websockets>=12,<17         # streaming AI chat connection
+python-dotenv>=1.0,<2      # optional: reads settings from a .env file
