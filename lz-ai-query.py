@@ -52,6 +52,11 @@ TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SECRET_SETTING_RE = re.compile(
     r"""^(\s*["']?[A-Za-z0-9_]*(?:_KEY|_TOKEN|API_KEY)["']?\s*:)(\s*\S.*)?$"""
 )
+# a secret key with a value anywhere else on a line (a flow-style mapping, an
+# inline value): a form the line-by-line redaction cannot cover, so it is refused
+SECRET_ANYWHERE_RE = re.compile(
+    r"""["']?[A-Za-z0-9_]*(?:_KEY|_TOKEN|API_KEY)["']?\s*:\s*\S"""
+)
 
 
 # --------------------------------------------------------------------------
@@ -700,8 +705,19 @@ def redact_config_text(text):
     quoted. Whatever follows the key on more-indented lines is part of its
     value (a block scalar, a multi-line quoted or plain scalar, a value that
     starts on the next line) and is dropped with it; a secret key with no
-    value at all stays as it is."""
+    value at all stays as it is. A secret in a form the line-anchored key
+    cannot see (a flow-style mapping, an inline value) raises ValueError:
+    the copy is refused, never saved with the credential in it."""
     lines = text.splitlines()
+    for number, line in enumerate(lines, 1):
+        if line.lstrip().startswith("#") or SECRET_SETTING_RE.match(line):
+            continue
+        if SECRET_ANYWHERE_RE.search(line):
+            raise ValueError(
+                f"line {number}: a secret in a form the redaction does not cover (a "
+                "flow-style mapping or an inline value); write the setting as "
+                "KEY: value on its own line"
+            )
     out = []
     i = 0
     while i < len(lines):
@@ -1311,9 +1327,16 @@ def main():
         parser.error("--reload-wait must be zero or more seconds")
     if args.trace_wait < 0:
         parser.error("--trace-wait must be zero or more seconds")
-    config_path = config_text = None
+    config_path = config_text = redacted_config = None
     if args.deploy_config:
         config_path, config_text = read_config_file(args.deploy_config)
+        if args.save_dir:
+            # judged before anything is deployed: a config whose secrets the
+            # redaction cannot cover is refused, not saved with them in it
+            try:
+                redacted_config = redact_config_text(config_text)
+            except ValueError as exc:
+                die(f"{config_path}: {exc}")
 
     mode = "quiet" if args.quiet else ("verbose" if args.verbose else "normal")
     reporter = Reporter(mode)
@@ -1358,7 +1381,7 @@ def main():
         deploy_config(host, config_path, args.reload_wait, reporter)
         if args.save_dir:
             copy = output_dir(args.save_dir, args.tag) / "ai-config.yaml"
-            copy.write_text(redact_config_text(config_text), encoding="utf-8")
+            copy.write_text(redacted_config, encoding="utf-8")
             reporter(f"saved {copy.name} (secrets redacted)")
 
     client = LogZillaAI(
