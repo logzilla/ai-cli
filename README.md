@@ -191,8 +191,20 @@ output:
   --raw                 Include raw WebSocket messages in JSON/saved output.
   --save-dir DIR        Also write a .json and .md file per question.
   --keep-charts         Keep the <chart> JSON blocks in terminal output.
+  --tag TAG             Write the saved files under <save-dir>/<tag>/.
   -q, --quiet           Print only the answer.
   -v, --verbose         Show connection details and extra progress.
+
+capture:
+  --deploy-config PATH  Copy this ai.yaml to the server as root over SSH,
+                        reload the AI settings, wait, then ask.
+  --reload-wait SECONDS Seconds to wait after the reload (default: 30).
+  --export-trace        Save each question's Phoenix trace beside its result.
+  --phoenix-url URL     The Phoenix server (TRACING_SERVER_URL's host).
+  --phoenix-project NAME
+                        The Phoenix project (TRACING_PROJECT_NAME).
+  --trace-wait SECONDS  Seconds to wait for a trace to land in Phoenix
+                        (default: 60).
 ```
 
 ## JSON output
@@ -230,6 +242,42 @@ To pull just the answer out, use `jq`:
 | --- | --- |
 | `<timestamp>-<question-slug>.json` | Same structure as `--json` output |
 | `<timestamp>-<question-slug>.md` | Readable transcript: question, answer, tool calls, errors |
+
+## Capturing a run the way LogZilla certifies models
+
+LogZilla certifies AI models by running this same tool against a test server
+and keeping, per question, the result, the AI settings that were active and
+the question's trace. Three flags let you capture a run in your own lab the
+same way, so a model you test on your hardware can be compared with a
+published row like for like.
+
+```bash
+./lz-ai-query.py --file question.txt --save-dir ./results --tag llama-70b-l40s \
+    --deploy-config ./ai.yaml --export-trace
+```
+
+| Flag | What it does |
+| --- | --- |
+| `--tag TAG` | Writes the files under `results/<tag>/`, so one directory holds one model or hardware setup. Needs `--save-dir`. |
+| `--deploy-config PATH` | Before the first question, copies the file to `/etc/logzilla/settings/ai.yaml` on the server as `root` over SSH (`scp`, then `ssh root@<host> logzilla settings reload ai`) and waits `--reload-wait` seconds (default 30) for the settings to apply. A failed copy or reload stops the run with the server's own message. With `--save-dir`, a copy of the file is saved as `ai-config.yaml` with every `*_KEY`, `*_TOKEN` and `API_KEY` value replaced by `<redacted>`. |
+| `--export-trace` | After each answer, finds the question's trace on the Phoenix server the AI settings send traces to (`TRACING_ENABLED: true`, `TRACING_SERVER_URL`, `TRACING_PROJECT_NAME`) and saves it as `<timestamp>-<slug>-trace.json` beside the result: every span with its name, timings, input, output and token counts. The server and project come from `--phoenix-url` and `--phoenix-project`, from `LZ_PHOENIX_URL` and `LZ_PHOENIX_PROJECT` in the environment or `.env`, or from the `--deploy-config` file's `TRACING_*` settings. |
+
+The trace is matched, never guessed: the tool looks at the root spans that
+started inside the question's own time window (five seconds of slack on each
+side), exports the candidates and keeps the one whose spans carry the question
+text, matched as a whole. Phoenix ingests spans a few seconds after the answer
+arrives, so the lookup is repeated every five seconds for up to `--trace-wait`
+seconds (default 60) before the trace is reported missing. A question with no
+such trace, or with more than one, is reported as a trace error for that
+question (`"trace": {"status": "missing"}` or `"ambiguous"` in the JSON, exit
+code 2), because a run without its trace cannot be scored; a Phoenix failure
+during the lookup is `"status": "error"` with the server's words, the answer
+still saved. More than five roots in one window is also ambiguous; keep the
+test server to one run at a time. The project named by `TRACING_PROJECT_NAME`
+may be new: Phoenix creates it with the first trace that reaches it.
+
+`--deploy-config` needs root SSH access to the LogZilla server. The other two
+flags need only the API token and, for the trace, network access to Phoenix.
 
 ## Exit codes
 
