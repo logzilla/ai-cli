@@ -86,6 +86,19 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("EMPTY_KEY:\n", out)
         self.assertIn("MODEL_NAME: claude-opus-5-5\n", out)
 
+    def test_a_secret_in_a_form_the_redaction_does_not_cover_is_refused(self):
+        """A flow-style mapping or an inline value never matches the line-anchored
+        key, so the copy is refused rather than saved with the credential in it;
+        a comment that names a key is not a value."""
+        for text in (
+            '{"MODEL_TYPE": "anthropic", "API_KEY": "sk-live-secret"}\n',
+            "settings: {MODEL_TYPE: anthropic, API_KEY: sk-live-secret}\n",
+        ):
+            with self.assertRaises(ValueError):
+                tool.redact_config_text(text)
+        out = tool.redact_config_text("# API_KEY: from the vault\nAPI_KEY: sk-live\n")
+        self.assertEqual(out, "# API_KEY: from the vault\nAPI_KEY: <redacted>\n")
+
 
 class TracingSettingsTests(unittest.TestCase):
     def test_the_phoenix_base_and_project_come_from_the_config(self):
