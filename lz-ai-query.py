@@ -15,6 +15,7 @@ See README.md for full usage.
 
 import argparse
 import asyncio
+import functools
 import json
 import os
 import re
@@ -44,12 +45,13 @@ TRACE_MAX_SPANS = 500
 TRACE_WAIT_DEFAULT = 60          # seconds to wait for a question's trace to land in Phoenix
 TRACE_POLL_S = 5                 # seconds between lookups while waiting
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-# a YAML line whose key (quoted or not) names a secret: the value is replaced in
-# the saved copy; a block scalar (| or >) continues on the indented lines below it
+# a YAML line whose key (quoted or not) names a secret: its value is replaced in
+# the saved copy, and so is any continuation of it on the more-indented lines
+# below (a block scalar, a multi-line quoted or plain scalar, a value that starts
+# on the next line)
 SECRET_SETTING_RE = re.compile(
-    r"""^(\s*["']?[A-Za-z0-9_]*(?:_KEY|_TOKEN|API_KEY)["']?\s*:\s*)(\S.*)$"""
+    r"""^(\s*["']?[A-Za-z0-9_]*(?:_KEY|_TOKEN|API_KEY)["']?\s*:)(\s*\S.*)?$"""
 )
-BLOCK_SCALAR_RE = re.compile(r"^[|>][0-9+-]{0,2}(\s+#.*)?$")
 
 
 # --------------------------------------------------------------------------
@@ -695,23 +697,34 @@ def save_result(result, save_dir, include_raw=False, tag=None):
 def redact_config_text(text):
     """The ai.yaml text with every *_KEY, *_TOKEN and API_KEY value replaced
     by <redacted>, so the saved copy never carries a secret. The key may be
-    quoted; a block-scalar value (`API_KEY: |-` and the indented lines under
-    it) is dropped whole, its header replaced like any other value."""
+    quoted. Whatever follows the key on more-indented lines is part of its
+    value (a block scalar, a multi-line quoted or plain scalar, a value that
+    starts on the next line) and is dropped with it; a secret key with no
+    value at all stays as it is."""
+    lines = text.splitlines()
     out = []
-    block_indent = None   # the indent of a secret key whose block scalar is being dropped
-    for line in text.splitlines():
-        indent = len(line) - len(line.lstrip())
-        if block_indent is not None:
-            if not line.strip() or indent > block_indent:
-                continue
-            block_indent = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         match = SECRET_SETTING_RE.match(line)
         if not match:
             out.append(line)
+            i += 1
             continue
-        out.append(match.group(1) + "<redacted>")
-        if BLOCK_SCALAR_RE.match(match.group(2).strip()):
-            block_indent = indent
+        indent = len(line) - len(line.lstrip())
+        end = i + 1   # the first line after the key that is not its continuation
+        while end < len(lines) and (
+            not lines[end].strip()
+            or len(lines[end]) - len(lines[end].lstrip()) > indent
+        ):
+            end += 1
+        continued = any(lines[j].strip() for j in range(i + 1, end))
+        if match.group(2) is None and not continued:
+            out.append(line)   # `KEY:` with nothing under it: an empty value, kept
+            i += 1
+            continue
+        out.append(match.group(1) + " <redacted>")
+        i = end if continued else i + 1
     return "\n".join(out) + "\n"
 
 
@@ -1038,7 +1051,7 @@ async def run_queries(client, queries, args, reporter):
                     reporter.heading(f"Question {i}/{total}: "
                                      f"{_preview(query)}")
                 results.append(await chat.ask(query))
-                _emit(results[-1], args, reporter, multiple=total > 1)
+                await _emit(results[-1], args, reporter, multiple=total > 1)
         return results
 
     for i, query in enumerate(queries, 1):
@@ -1048,7 +1061,7 @@ async def run_queries(client, queries, args, reporter):
         async with client.session(conv_id) as chat:
             result = await chat.ask(query)
         results.append(result)
-        _emit(result, args, reporter, multiple=total > 1)
+        await _emit(result, args, reporter, multiple=total > 1)
 
     return results
 
@@ -1088,7 +1101,7 @@ async def run_interactive(client, args, reporter):
                     print("\n  ! aborted", file=sys.stderr)
                     continue
                 results.append(result)
-                _emit(result, args, reporter, multiple=False)
+                await _emit(result, args, reporter, multiple=False)
                 if result.errors and not result.answer:
                     # A dead socket cannot be reused; start a new session.
                     break
@@ -1100,15 +1113,20 @@ def _preview(query, width=70):
         else single_line
 
 
-def _emit(result, args, reporter, multiple):
-    """Print and optionally persist one result."""
+async def _emit(result, args, reporter, multiple):
+    """Print and optionally persist one result. The trace lookup (blocking
+    HTTP calls and the ingestion wait) runs in a worker thread: with
+    --same-conversation the WebSocket stays open across questions, and a
+    blocked event loop would miss the server's heartbeat and lose it."""
     trace = None
     if args.export_trace and result.start_time:
+        lookup = functools.partial(
+            find_trace, args.phoenix_base, args.phoenix_project, result,
+            verify_tls=not args.insecure, wait_s=args.trace_wait,
+        )
         try:
-            status, trace_ids, trace = find_trace(
-                args.phoenix_base, args.phoenix_project, result,
-                verify_tls=not args.insecure, wait_s=args.trace_wait,
-            )
+            status, trace_ids, trace = await asyncio.get_running_loop().run_in_executor(
+                None, lookup)
             detail = (", ".join(trace_ids) if trace_ids
                       else "no root span in the window carries the question")
         except TraceError as exc:
