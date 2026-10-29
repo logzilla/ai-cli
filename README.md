@@ -203,6 +203,8 @@ capture:
   --phoenix-url URL     The Phoenix server (TRACING_SERVER_URL's host).
   --phoenix-project NAME
                         The Phoenix project (TRACING_PROJECT_NAME).
+  --trace-wait SECONDS  Seconds to wait for a trace to land in Phoenix
+                        (default: 60).
 ```
 
 ## JSON output
@@ -263,11 +265,16 @@ published row like for like.
 The trace is matched, never guessed: the tool looks at the root spans that
 started inside the question's own time window (five seconds of slack on each
 side), exports the candidates and keeps the one whose spans carry the question
-text. A question with no such trace, or with more than one, is reported as a
-trace error for that question (`"trace": {"status": "missing"}` or
-`"ambiguous"` in the JSON, exit code 2), because a run without its trace cannot
-be scored. More than five roots in one window is also ambiguous; keep the test
-server to one run at a time.
+text, matched as a whole. Phoenix ingests spans a few seconds after the answer
+arrives, so the lookup is repeated every five seconds for up to `--trace-wait`
+seconds (default 60) before the trace is reported missing. A question with no
+such trace, or with more than one, is reported as a trace error for that
+question (`"trace": {"status": "missing"}` or `"ambiguous"` in the JSON, exit
+code 2), because a run without its trace cannot be scored; a Phoenix failure
+during the lookup is `"status": "error"` with the server's words, the answer
+still saved. More than five roots in one window is also ambiguous; keep the
+test server to one run at a time. The project named by `TRACING_PROJECT_NAME`
+may be new: Phoenix creates it with the first trace that reaches it.
 
 `--deploy-config` needs root SSH access to the LogZilla server. The other two
 flags need only the API token and, for the trace, network access to Phoenix.

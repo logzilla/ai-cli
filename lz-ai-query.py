@@ -41,9 +41,15 @@ RELOAD_WAIT_DEFAULT = 30          # seconds the server takes to apply reloaded A
 TRACE_WINDOW_SLACK_S = 5          # a trace root may start this much before/after the question
 TRACE_MAX_CANDIDATES = 5          # more roots in one question's window is ambiguous, not a guess
 TRACE_MAX_SPANS = 500
+TRACE_WAIT_DEFAULT = 60          # seconds to wait for a question's trace to land in Phoenix
+TRACE_POLL_S = 5                 # seconds between lookups while waiting
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-# a YAML line whose key names a secret: the value is replaced in the saved copy
-SECRET_SETTING_RE = re.compile(r"^(\s*[A-Za-z0-9_]*(?:_KEY|_TOKEN|API_KEY)\s*:\s*)(?=\S).*$")
+# a YAML line whose key (quoted or not) names a secret: the value is replaced in
+# the saved copy; a block scalar (| or >) continues on the indented lines below it
+SECRET_SETTING_RE = re.compile(
+    r"""^(\s*["']?[A-Za-z0-9_]*(?:_KEY|_TOKEN|API_KEY)["']?\s*:\s*)(\S.*)$"""
+)
+BLOCK_SCALAR_RE = re.compile(r"^[|>][0-9+-]{0,2}(\s+#.*)?$")
 
 
 # --------------------------------------------------------------------------
@@ -688,10 +694,25 @@ def save_result(result, save_dir, include_raw=False, tag=None):
 
 def redact_config_text(text):
     """The ai.yaml text with every *_KEY, *_TOKEN and API_KEY value replaced
-    by <redacted>, line by line, so the saved copy never carries a secret."""
-    lines = [SECRET_SETTING_RE.sub(r"\1<redacted>", line)
-             for line in text.splitlines()]
-    return "\n".join(lines) + "\n"
+    by <redacted>, so the saved copy never carries a secret. The key may be
+    quoted; a block-scalar value (`API_KEY: |-` and the indented lines under
+    it) is dropped whole, its header replaced like any other value."""
+    out = []
+    block_indent = None   # the indent of a secret key whose block scalar is being dropped
+    for line in text.splitlines():
+        indent = len(line) - len(line.lstrip())
+        if block_indent is not None:
+            if not line.strip() or indent > block_indent:
+                continue
+            block_indent = None
+        match = SECRET_SETTING_RE.match(line)
+        if not match:
+            out.append(line)
+            continue
+        out.append(match.group(1) + "<redacted>")
+        if BLOCK_SCALAR_RE.match(match.group(2).strip()):
+            block_indent = indent
+    return "\n".join(out) + "\n"
 
 
 def read_config_file(path):
@@ -701,9 +722,23 @@ def read_config_file(path):
     return path, path.read_text(encoding="utf-8")
 
 
+def yaml_scalar(raw):
+    """The text of a plain or quoted YAML scalar: a quoted value is what the
+    quotes enclose, a plain one ends at a trailing ` #` comment (the same
+    conventions parse_env_line applies to .env values)."""
+    raw = raw.strip()
+    if raw[:1] in ("'", '"'):
+        end = raw.find(raw[0], 1)
+        return raw[1:end] if end > 0 else raw[1:]
+    if raw.startswith("#"):
+        return ""
+    return raw.split(" #", 1)[0].rstrip()
+
+
 def tracing_from_config(text):
     """(Phoenix base URL, project name) from TRACING_SERVER_URL and
-    TRACING_PROJECT_NAME in the ai.yaml text; None for a missing one."""
+    TRACING_PROJECT_NAME in the ai.yaml text; None for a missing one. A
+    trailing comment is not part of the value."""
     url = project = None
     for line in text.splitlines():
         match = re.match(
@@ -712,7 +747,9 @@ def tracing_from_config(text):
         )
         if not match:
             continue
-        value = match.group(2).strip().strip("'\"")
+        value = yaml_scalar(match.group(2))
+        if not value:
+            continue
         if match.group(1) == "TRACING_SERVER_URL":
             url = value
         else:
@@ -729,17 +766,24 @@ def phoenix_base(url):
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def deploy_steps(host, config_path):
+    """The scp and ssh commands of the deploy. urlparse strips the brackets
+    of an IPv6 literal; scp needs them back or it reads the first colon as
+    the host/path separator (ssh takes the bare address)."""
+    hostname = urlparse(host).hostname
+    scp_host = f"[{hostname}]" if ":" in hostname else hostname
+    return [
+        ["scp", str(config_path), f"root@{scp_host}:{REMOTE_AI_YAML}"],
+        ["ssh", f"root@{hostname}", "logzilla", "settings", "reload", "ai"],
+    ]
+
+
 def deploy_config(host, config_path, wait_s, reporter):
     """Copy the config to the server as root over SSH, reload the AI
     settings, wait for them to apply. Any failure stops the run with the
     remote's own words: a question asked against a half-applied config is
     not a result worth keeping."""
-    hostname = urlparse(host).hostname
-    steps = [
-        ["scp", str(config_path), f"root@{hostname}:{REMOTE_AI_YAML}"],
-        ["ssh", f"root@{hostname}", "logzilla", "settings", "reload", "ai"],
-    ]
-    for argv in steps:
+    for argv in deploy_steps(host, config_path):
         reporter(" ".join(argv), level="detail")
         try:
             proc = subprocess.run(argv, capture_output=True, text=True)
@@ -777,32 +821,41 @@ PHOENIX_TRACE_QUERY = (
 )
 
 
+class TraceError(Exception):
+    """A Phoenix step that failed. Raised after the answer is captured, it is
+    recorded on that question (the answer is still saved, the question fails)
+    rather than ending the run."""
+
+
 def phoenix_graphql(base, query, variables, verify_tls=True):
     url = f"{base}/graphql"
     try:
         resp = requests.post(url, json={"query": query, "variables": variables},
                              timeout=CONNECT_TIMEOUT, verify=verify_tls)
     except requests.exceptions.RequestException as exc:
-        die(f"cannot reach Phoenix at {url}: {exc}")
+        raise TraceError(f"cannot reach Phoenix at {url}: {exc}")
     if resp.status_code != 200:
-        die(f"Phoenix {url} answered HTTP {resp.status_code}: {resp.text[:200]}")
+        raise TraceError(f"Phoenix {url} answered HTTP {resp.status_code}: "
+                         f"{resp.text[:200]}")
     try:
         doc = resp.json()
     except ValueError:
-        die(f"Phoenix {url}: the answer is not JSON")
+        raise TraceError(f"Phoenix {url}: the answer is not JSON")
     if doc.get("errors"):
-        die(f"Phoenix {url}: {doc['errors']}")
+        raise TraceError(f"Phoenix {url}: {doc['errors']}")
     return doc.get("data") or {}
 
 
 def phoenix_project_id(base, name, verify_tls=True):
+    """The project's id, or None while no trace has reached it: Phoenix
+    creates a project with its first span, so a fresh TRACING_PROJECT_NAME
+    exists only after the first question is traced."""
     data = phoenix_graphql(base, PHOENIX_PROJECT_QUERY, {"name": name},
                            verify_tls)
     node = data.get("getProjectByName")
     if isinstance(node, dict) and node.get("id"):
         return str(node["id"])
-    die(f"Phoenix {base}: no project named {name!r} (has the server sent any "
-        "trace to it yet?)")
+    return None
 
 
 def phoenix_export(base, trace_id, verify_tls=True):
@@ -811,11 +864,11 @@ def phoenix_export(base, trace_id, verify_tls=True):
                            verify_tls)
     trace = data.get("getTraceByOtelId")
     if not isinstance(trace, dict):
-        die(f"Phoenix {base}: trace {trace_id} not found")
+        raise TraceError(f"Phoenix {base}: trace {trace_id} not found")
     num = trace.get("numSpans")
     if isinstance(num, int) and num > TRACE_MAX_SPANS:
-        die(f"Phoenix {base}: trace {trace_id} has {num} spans, over the "
-            f"{TRACE_MAX_SPANS} cap")
+        raise TraceError(f"Phoenix {base}: trace {trace_id} has {num} spans, over "
+                         f"the {TRACE_MAX_SPANS} cap")
     spans = [edge["node"] for edge in (trace.get("spans") or {}).get("edges") or []
              if edge.get("node")]
     head = {key: trace.get(key)
@@ -849,11 +902,30 @@ def _strings_of(value):
     return out
 
 
-def find_trace(base, project_id, result, verify_tls=True):
+def find_trace(base, project, result, verify_tls=True, wait_s=TRACE_WAIT_DEFAULT,
+               sleep=time.sleep, clock=time.monotonic):
     """The one Phoenix trace of this question: a root span that started
     inside the question's window and whose spans carry the question text.
     Returns (status, trace_ids, trace): 'exported' with the trace, 'missing'
-    with nothing, or 'ambiguous' with the candidates. It never guesses."""
+    with nothing, or 'ambiguous' with the candidates. It never guesses.
+
+    Phoenix ingests spans after the answer arrives, so a trace that is not
+    there yet is looked up again every TRACE_POLL_S seconds for up to wait_s
+    seconds (the question's window stays fixed). The project is resolved
+    here, not at startup: it exists only once its first trace landed. A
+    Phoenix failure raises TraceError."""
+    deadline = clock() + wait_s
+    while True:
+        found = _lookup_trace(base, project, result, verify_tls)
+        if found[0] != "missing" or clock() >= deadline:
+            return found
+        sleep(min(TRACE_POLL_S, deadline - clock()))
+
+
+def _lookup_trace(base, project, result, verify_tls):
+    project_id = phoenix_project_id(base, project, verify_tls)
+    if project_id is None:
+        return "missing", [], None
     start = result.start_time - TRACE_WINDOW_SLACK_S
     end = (result.end_time or time.time()) + TRACE_WINDOW_SLACK_S
     data = phoenix_graphql(
@@ -885,7 +957,10 @@ def find_trace(base, project_id, result, verify_tls=True):
         for span in trace["spans"]:
             for key in ("input", "output"):
                 texts.extend(_strings_of((span.get(key) or {}).get("value")))
-        if any(needle in " ".join(text.split()) for text in texts):
+        # the question is a whole message string in the trace (the user turn),
+        # so the match is on the complete normalized string: a longer question
+        # that merely contains this one is another question's trace
+        if any(" ".join(text.split()) == needle for text in texts):
             matches.append((trace_id, trace))
     if len(matches) == 1:
         return "exported", [matches[0][0]], matches[0][1]
@@ -1029,18 +1104,26 @@ def _emit(result, args, reporter, multiple):
     """Print and optionally persist one result."""
     trace = None
     if args.export_trace and result.start_time:
-        status, trace_ids, trace = find_trace(
-            args.phoenix_base, args.phoenix_project_id, result,
-            verify_tls=not args.insecure,
-        )
+        try:
+            status, trace_ids, trace = find_trace(
+                args.phoenix_base, args.phoenix_project, result,
+                verify_tls=not args.insecure, wait_s=args.trace_wait,
+            )
+            detail = (", ".join(trace_ids) if trace_ids
+                      else "no root span in the window carries the question")
+        except TraceError as exc:
+            # the answer is captured; a Phoenix failure is this question's
+            # trace error, saved with it, and the next question still runs
+            status, trace_ids, trace, detail = "error", [], None, str(exc)
         base = result_base(result, args.save_dir, args.tag)
         result.trace = {
             "status": status,
             "trace_ids": trace_ids,
             "path": str(trace_path_for(base)) if trace is not None else None,
         }
+        if status == "error":
+            result.trace["error"] = detail
         if trace is None:
-            detail = ", ".join(trace_ids) if trace_ids else "no root span in the window"
             result.errors.append(f"trace {status}: {detail}")
             reporter(f"  ! trace {status}: {detail}", level="progress")
 
@@ -1163,14 +1246,20 @@ Exit codes:
                           "<timestamp>-<slug>-trace.json. Needs --save-dir "
                           "and the Phoenix server and project (flags, "
                           "LZ_PHOENIX_URL / LZ_PHOENIX_PROJECT, or the "
-                          "--deploy-config file's TRACING_* settings). A "
-                          "missing or ambiguous trace is an error for that "
-                          "question.")
+                          "--deploy-config file's TRACING_* settings). The "
+                          "lookup waits --trace-wait seconds for Phoenix to "
+                          "ingest the trace; a missing, ambiguous or failed "
+                          "trace is an error for that question.")
     cap.add_argument("--phoenix-url", metavar="URL",
                      help="The Phoenix server (the TRACING_SERVER_URL of the "
                           "LogZilla AI settings, scheme and host).")
     cap.add_argument("--phoenix-project", metavar="NAME",
                      help="The Phoenix project (TRACING_PROJECT_NAME).")
+    cap.add_argument("--trace-wait", type=int, default=TRACE_WAIT_DEFAULT,
+                     metavar="SECONDS",
+                     help="Seconds to wait for a question's trace to land in "
+                          f"Phoenix before reporting it missing (default: "
+                          f"{TRACE_WAIT_DEFAULT}).")
 
     parser.add_argument(
         "--same-conversation", action="store_true",
@@ -1202,6 +1291,8 @@ def main():
         parser.error("--export-trace needs --save-dir")
     if args.reload_wait < 0:
         parser.error("--reload-wait must be zero or more seconds")
+    if args.trace_wait < 0:
+        parser.error("--trace-wait must be zero or more seconds")
     config_path = config_text = None
     if args.deploy_config:
         config_path, config_text = read_config_file(args.deploy_config)
@@ -1233,8 +1324,15 @@ def main():
                 "LZ_PHOENIX_PROJECT, or give --deploy-config an ai.yaml that "
                 "sets TRACING_SERVER_URL and TRACING_PROJECT_NAME")
         args.phoenix_base = phoenix_base(phoenix_url)
-        args.phoenix_project_id = phoenix_project_id(
-            args.phoenix_base, phoenix_project, verify_tls=not args.insecure)
+        args.phoenix_project = phoenix_project
+        # the server must answer before any question is asked (a wrong URL
+        # is a flag error, not a trace error); the project may not exist
+        # yet, Phoenix creates it with the first trace that reaches it
+        try:
+            phoenix_project_id(args.phoenix_base, phoenix_project,
+                               verify_tls=not args.insecure)
+        except TraceError as exc:
+            die(str(exc))
         reporter(f"Phoenix: {args.phoenix_base}, project {phoenix_project}",
                  level="detail")
 
