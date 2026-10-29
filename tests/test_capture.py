@@ -1,10 +1,12 @@
 """The capture flags: the redacted config copy, the tracing settings read from
 the config, the tag, the trace match. Run: python3 -m unittest discover -s tests -v"""
 
+import asyncio
 import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -62,6 +64,27 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("FOLDED_TOKEN: <redacted>\n", out)
         self.assertIn("MODEL_NAME: claude-opus-5-5\n", out)
         self.assertIn("TRACING_PROJECT_NAME: lab-1\n", out)
+
+    def test_a_value_on_the_lines_below_the_key_is_redacted_whole(self):
+        config = (
+            "API_KEY:\n"
+            "  sk-next-line-secret\n"
+            "SOME_TOKEN: \"first line\n"
+            "  second-line-of-quoted-secret\"\n"
+            "OTHER_KEY: plain first\n"
+            "  plain-continuation-secret\n"
+            "EMPTY_KEY:\n"
+            "MODEL_NAME: claude-opus-5-5\n"
+        )
+        out = tool.redact_config_text(config)
+        for secret in ("sk-next-line-secret", "second-line-of-quoted-secret",
+                       "plain-continuation-secret", "first line", "plain first"):
+            self.assertNotIn(secret, out)
+        self.assertIn("API_KEY: <redacted>\n", out)
+        self.assertIn("SOME_TOKEN: <redacted>\n", out)
+        self.assertIn("OTHER_KEY: <redacted>\n", out)
+        self.assertIn("EMPTY_KEY:\n", out)
+        self.assertIn("MODEL_NAME: claude-opus-5-5\n", out)
 
 
 class TracingSettingsTests(unittest.TestCase):
@@ -297,7 +320,7 @@ class EmitTests(unittest.TestCase):
                 export_trace=True, save_dir=tmp, tag=None, json=False, raw=False,
                 keep_charts=False, insecure=False, phoenix_base="http://p",
                 phoenix_project="lab-1", trace_wait=0)
-            tool._emit(result, args, lambda *a, **k: None, multiple=True)
+            asyncio.run(tool._emit(result, args, lambda *a, **k: None, multiple=True))
             saved = list(Path(tmp).glob("*.json"))
             self.assertEqual(len(saved), 1)
             doc = json.loads(saved[0].read_text(encoding="utf-8"))
@@ -306,6 +329,30 @@ class EmitTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(doc["trace"]["status"], "error")
         self.assertEqual(doc["answer"], "host-1 leads")
+
+    def test_the_lookup_runs_off_the_event_loop_thread(self):
+        """With --same-conversation the socket stays open across questions; a
+        lookup that blocks the loop (HTTP calls, the ingestion wait) would let
+        the server's heartbeat close it, so the lookup runs in a worker thread."""
+        seen = {}
+
+        def recording(*args, **kwargs):
+            seen["thread"] = threading.current_thread()
+            return "missing", [], None
+        tool.find_trace = recording
+        result = tool.QueryResult("Top hosts?")
+        result.start_time = 1700000000.0
+        result.end_time = 1700000020.0
+        result.answer = "host-1 leads"
+        self.assertTrue(asyncio.iscoroutinefunction(tool._emit))
+        with tempfile.TemporaryDirectory() as tmp:
+            args = types.SimpleNamespace(
+                export_trace=True, save_dir=tmp, tag=None, json=False, raw=False,
+                keep_charts=False, insecure=False, phoenix_base="http://p",
+                phoenix_project="lab-1", trace_wait=0)
+            asyncio.run(tool._emit(result, args, lambda *a, **k: None, multiple=True))
+        self.assertIsNot(seen["thread"], threading.main_thread())
+        self.assertEqual(result.trace["status"], "missing")
 
 
 if __name__ == "__main__":
