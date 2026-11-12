@@ -318,3 +318,7 @@ follow-up questions in `--interactive` or `--same-conversation`.
 - Saved transcripts contain your log data. Store them accordingly.
 - Answers come from an AI assistant querying your live log data. Verify anything
   you plan to act on.
+
+## Contributing
+
+Commits to this repository are authored as `LogZilla Engineering <devteam@logzilla.net>`.
